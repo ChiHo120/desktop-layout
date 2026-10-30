@@ -1,13 +1,35 @@
 ﻿# 桌面小灵宠：浮在 Windows 桌面上，显示这台电脑的实时传感器。
 param(
     [switch]$SelfTest,
-    [switch]$Shot
+    [switch]$Shot,
+    [switch]$QuotaSelfTest
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $lib = Join-Path $root 'sensors.ps1'
 . $lib
+
+$quotaSettingsLib = Join-Path $root 'quota-settings.ps1'
+$quotaWorkerLib = Join-Path $root 'quota-worker.ps1'
+
+if ($QuotaSelfTest) {
+    . $quotaWorkerLib
+    $quotaSettings = Get-SpiritQuotaSettings (Join-Path $env:LOCALAPPDATA '桌面小灵宠')
+    $cursorResult = Read-SpiritQuota -Provider Cursor -Settings $quotaSettings
+    $tokenResult = Read-SpiritQuota -Provider Token -Settings $quotaSettings
+    Write-Output ('CURSOR {0} {1}' -f $cursorResult.State, $cursorResult.Text)
+    Write-Output ('  {0}' -f $cursorResult.Detail)
+    foreach ($bucketName in @('Auto', 'Advanced', 'Grok')) {
+        if ($null -ne $cursorResult.Buckets -and $null -ne $cursorResult.Buckets[$bucketName]) {
+            $bucket = $cursorResult.Buckets[$bucketName]
+            Write-Output ('  {0}: {1} {2} · {3}' -f $bucketName, $bucket.State, $bucket.Text, $bucket.Detail)
+        }
+    }
+    Write-Output ('TOKEN_API {0} {1}' -f $tokenResult.State, $tokenResult.Text)
+    Write-Output ('  {0}' -f $tokenResult.Detail)
+    return
+}
 
 if ($SelfTest) {
     $snap = Get-SpiritSnapshot
@@ -41,6 +63,9 @@ namespace SpiritNative {
         public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("user32.dll")]
         public static extern uint GetDpiForWindow(IntPtr hwnd);
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
     }
 }
 '@
@@ -81,6 +106,17 @@ $sync = [hashtable]::Synchronized(@{
     Ready = $false
     Gpu = $null
     GpuKnown = $false
+    CursorQuota = @{
+        State = 'loading'; Text = '读取中'; Detail = '每 30 秒刷新'; RemainingPercent = $null; UpdatedAt = $null
+        Buckets = @{
+            Auto = @{ State = 'loading'; Text = '读取中'; RemainingPercent = $null }
+            Advanced = @{ State = 'loading'; Text = '读取中'; RemainingPercent = $null }
+            Grok = @{ State = 'loading'; Text = '读取中'; RemainingPercent = $null }
+        }
+    }
+    TokenQuota = @{ State = 'disabled'; Text = '未连接'; Detail = '右键 → 设置额度连接'; RemainingPercent = $null; UpdatedAt = $null }
+    QuotaRefreshRequested = $false
+    QuotaReady = $false
 })
 
 $fast = [powershell]::Create()
@@ -127,6 +163,25 @@ $gpuPs.Runspace = $gpuRs
 }).AddArgument($sync).AddArgument($lib)
 $gpuHandle = $gpuPs.BeginInvoke()
 
+$quotaPs = [powershell]::Create()
+$quotaRs = [runspacefactory]::CreateRunspace()
+$quotaRs.Open()
+$quotaPs.Runspace = $quotaRs
+[void]$quotaPs.AddScript({
+    param($sync, $stateDir, $workerLib)
+    $ErrorActionPreference = 'Stop'
+    try {
+        . $workerLib
+        Invoke-SpiritQuotaPolling -Sync $sync -StateDir $stateDir
+    } catch {
+        $failure = @{ State = 'error'; Text = '暂不可用'; Detail = '额度模块启动失败，请重启小灵宠'; RemainingPercent = $null; UpdatedAt = $null }
+        $sync.CursorQuota = $failure
+        $sync.TokenQuota = $failure
+        $sync.QuotaReady = $true
+    }
+}).AddArgument($sync).AddArgument($stateDir).AddArgument($quotaWorkerLib)
+$quotaHandle = $quotaPs.BeginInvoke()
+
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -143,11 +198,14 @@ $xaml = @'
         FontFamily="Microsoft YaHei UI">
     <Window.ContextMenu>
         <ContextMenu>
-            <MenuItem x:Name="MenuPanel" Header="收起数据"/>
+            <MenuItem x:Name="MenuPanel" Header="展开数据"/>
             <MenuItem x:Name="MenuSmaller" Header="缩小"/>
             <MenuItem x:Name="MenuLarger" Header="放大"/>
             <MenuItem x:Name="MenuTopmost" Header="始终在最前" IsCheckable="True" IsChecked="True"/>
             <MenuItem x:Name="MenuStartup" Header="开机自动出现" IsCheckable="True"/>
+            <Separator/>
+            <MenuItem x:Name="MenuQuotaRefresh" Header="立即刷新额度"/>
+            <MenuItem x:Name="MenuQuotaSettings" Header="设置额度连接…"/>
             <Separator/>
             <MenuItem x:Name="MenuExit" Header="让小灵离开"/>
         </ContextMenu>
@@ -161,7 +219,7 @@ $xaml = @'
             <ColumnDefinition Width="164"/>
             <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <Border x:Name="Card" Grid.Column="1" CornerRadius="22" Padding="18,14,14,14" Margin="6,20,0,0" MinWidth="292">
+        <Border x:Name="Card" Grid.Column="1" Visibility="Collapsed" CornerRadius="22" Padding="18,14,14,14" MinWidth="292">
             <Border.Background>
                 <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
                     <GradientStop Color="#F0161C2B" Offset="0"/>
@@ -299,6 +357,64 @@ $xaml = @'
                     </Border>
                     <TextBlock x:Name="BatVal" Grid.Column="2" Text="--" Foreground="White" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                 </Grid>
+                <Border Margin="0,12,0,0" Padding="0,9,0,0" BorderThickness="0,1,0,0" BorderBrush="#22FFFFFF" Width="300" HorizontalAlignment="Left">
+                    <StackPanel>
+                        <Grid>
+                            <TextBlock Text="云端额度" Foreground="#D5DEEA" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                            <TextBlock Text="约每 30 秒更新" Foreground="#7E90A8" FontSize="10" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid Margin="0,7,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="72"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="112"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Cursor Auto" Foreground="#D5DEEA" VerticalAlignment="Center"/>
+                            <Border Grid.Column="1" Height="6" CornerRadius="3" Background="#22FFFFFF" Margin="0,0,8,0" VerticalAlignment="Center">
+                                <Border x:Name="CursorAutoQuotaBar" Width="0" Height="6" HorizontalAlignment="Left" CornerRadius="3" Background="#67E8F9"/>
+                            </Border>
+                            <TextBlock x:Name="CursorAutoQuotaVal" Grid.Column="2" Text="读取中" Foreground="White" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <Grid Margin="0,5,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="72"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="112"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="高级模型" Foreground="#D5DEEA" VerticalAlignment="Center"/>
+                            <Border Grid.Column="1" Height="6" CornerRadius="3" Background="#22FFFFFF" Margin="0,0,8,0" VerticalAlignment="Center">
+                                <Border x:Name="CursorAdvancedQuotaBar" Width="0" Height="6" HorizontalAlignment="Left" CornerRadius="3" Background="#38BDF8"/>
+                            </Border>
+                            <TextBlock x:Name="CursorAdvancedQuotaVal" Grid.Column="2" Text="读取中" Foreground="White" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <Grid Margin="0,5,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="72"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="112"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Grok AI" Foreground="#D5DEEA" VerticalAlignment="Center"/>
+                            <Border Grid.Column="1" Height="6" CornerRadius="3" Background="#22FFFFFF" Margin="0,0,8,0" VerticalAlignment="Center">
+                                <Border x:Name="CursorGrokQuotaBar" Width="0" Height="6" HorizontalAlignment="Left" CornerRadius="3" Background="#FBBF24"/>
+                            </Border>
+                            <TextBlock x:Name="CursorGrokQuotaVal" Grid.Column="2" Text="读取中" Foreground="White" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <TextBlock x:Name="CursorQuotaHint" Text="读取本机 Cursor 登录态" Foreground="#8EA0B8" FontSize="10" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
+                        <Grid Margin="0,7,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="72"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="112"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Token API" Foreground="#D5DEEA" VerticalAlignment="Center"/>
+                            <Border Grid.Column="1" Height="6" CornerRadius="3" Background="#22FFFFFF" Margin="0,0,8,0" VerticalAlignment="Center">
+                                <Border x:Name="TokenQuotaBar" Width="0" Height="6" HorizontalAlignment="Left" CornerRadius="3" Background="#A78BFA"/>
+                            </Border>
+                            <TextBlock x:Name="TokenQuotaVal" Grid.Column="2" Text="未连接" Foreground="White" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <TextBlock x:Name="TokenQuotaHint" Text="右键 → 设置额度连接" Foreground="#8EA0B8" FontSize="10" Margin="0,3,0,0" TextTrimming="CharacterEllipsis"/>
+                    </StackPanel>
+                </Border>
                 <Grid Margin="0,12,0,0">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="46"/>
@@ -334,14 +450,48 @@ $xaml = @'
                     </Slider>
                     <TextBlock x:Name="SizeVal" Grid.Column="2" Text="72%" Foreground="White" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                 </Grid>
-                <TextBlock x:Name="FootText" Text="拖动换位置，滚轮或滑条可缩放" Foreground="#7E90A8" FontSize="11" Margin="0,8,0,0"/>
+                <TextBlock x:Name="FootText" Text="点击小灵收起，滚轮或滑条可缩放" Foreground="#7E90A8" FontSize="11" Margin="0,8,0,0"/>
             </StackPanel>
         </Border>
 
-        <Canvas x:Name="Pet" Grid.Column="0" Width="164" Height="210" HorizontalAlignment="Center" VerticalAlignment="Center" Panel.ZIndex="2">
+        <Canvas x:Name="Pet" Grid.Column="0" Width="164" Height="276" HorizontalAlignment="Center" VerticalAlignment="Center" Panel.ZIndex="2">
             <Canvas.RenderTransform>
                 <TranslateTransform x:Name="PetBob" Y="0"/>
             </Canvas.RenderTransform>
+            <Border x:Name="QuotaHeadBadge" Canvas.Left="0" Canvas.Top="4" Width="164" Height="58" CornerRadius="11"
+                    Background="#F0161C2B" BorderBrush="#4467E8F9" BorderThickness="1" Padding="8,4" Cursor="Hand">
+                <StackPanel>
+                    <StackPanel x:Name="CursorAutoBadge" ToolTip="Cursor Auto 剩余额度；点击小灵展开其他数据">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="66"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Cursor Auto" FontSize="11" Foreground="#D5DEEA" VerticalAlignment="Center"/>
+                            <TextBlock x:Name="CursorAutoHeadVal" Grid.Column="1" Text="读取中" FontSize="12" FontWeight="SemiBold"
+                                       Foreground="#67E8F9" HorizontalAlignment="Right" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <Border Height="2" CornerRadius="1" Background="#22FFFFFF" Margin="0,2,0,0">
+                            <Border x:Name="CursorAutoHeadBar" Width="0" Height="2" CornerRadius="1" Background="#67E8F9" HorizontalAlignment="Left"/>
+                        </Border>
+                    </StackPanel>
+                    <StackPanel x:Name="TokenQuotaBadge" Margin="0,4,0,0" ToolTip="Token API 今日剩余额度；点击小灵展开其他数据">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="66"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Token API" FontSize="11" Foreground="#D5DEEA" VerticalAlignment="Center"/>
+                            <TextBlock x:Name="TokenQuotaHeadVal" Grid.Column="1" Text="未连接" FontSize="12" FontWeight="SemiBold"
+                                       Foreground="#A78BFA" HorizontalAlignment="Right" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                        <Border Height="2" CornerRadius="1" Background="#22FFFFFF" Margin="0,2,0,0">
+                            <Border x:Name="TokenQuotaHeadBar" Width="0" Height="2" CornerRadius="1" Background="#A78BFA" HorizontalAlignment="Left"/>
+                        </Border>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+            <Canvas x:Name="PetArt" Canvas.Left="0" Canvas.Top="66" Width="164" Height="210">
             <Ellipse Canvas.Left="36" Canvas.Top="168" Width="96" Height="16" Fill="#33000000"/>
             <Ellipse x:Name="Aura" Canvas.Left="16" Canvas.Top="42" Width="132" Height="132" Opacity="0.55">
                 <Ellipse.Fill>
@@ -399,6 +549,7 @@ $xaml = @'
                 </Ellipse.Fill>
             </Ellipse>
             <TextBlock x:Name="Zzz" Canvas.Left="118" Canvas.Top="36" Text="" Foreground="#E0F2FE" FontSize="16" FontWeight="Bold" Opacity="0"/>
+            </Canvas>
         </Canvas>
     </Grid>
     </Border>
@@ -422,7 +573,45 @@ $pupilL = Find 'PupilL'
 $pupilR = Find 'PupilR'
 $mouth = Find 'Mouth'
 $zzz = Find 'Zzz'
-$expanded = $true
+$expanded = $false
+
+function Initialize-DetailsWindow {
+    # Keep the existing namescope so Find and the live data updates keep working.
+    [void]$card.Parent.Children.Remove($card)
+    $script:detailsWindow = New-Object System.Windows.Window
+    $detailsWindow.Title = '小灵 · 详情'
+    $detailsWindow.WindowStyle = 'None'
+    $detailsWindow.ResizeMode = 'NoResize'
+    $detailsWindow.AllowsTransparency = $true
+    $detailsWindow.Background = [System.Windows.Media.Brushes]::Transparent
+    $detailsWindow.SizeToContent = 'WidthAndHeight'
+    $detailsWindow.ShowInTaskbar = $false
+    $detailsWindow.ShowActivated = $false
+    $detailsWindow.WindowStartupLocation = 'Manual'
+    $detailsWindow.FontFamily = $window.FontFamily
+    $detailsWindow.UseLayoutRounding = $true
+    $detailsWindow.SnapsToDevicePixels = $true
+    $detailsWindow.Topmost = $window.Topmost
+    $detailsWindow.ContextMenu = $window.ContextMenu
+
+    $script:detailsScale = [System.Windows.Media.ScaleTransform]::new(0.72, 0.72)
+    $detailsBody = New-Object System.Windows.Controls.Border
+    $detailsBody.LayoutTransform = $detailsScale
+    $detailsBody.Child = $card
+    $script:detailsViewport = New-Object System.Windows.Controls.ScrollViewer
+    $detailsViewport.VerticalScrollBarVisibility = 'Auto'
+    $detailsViewport.HorizontalScrollBarVisibility = 'Disabled'
+    $detailsViewport.Content = $detailsBody
+    $script:detailsFrame = New-Object System.Windows.Controls.Border
+    $detailsFrame.Background = [System.Windows.Media.Brushes]::Transparent
+    $detailsFrame.Padding = [System.Windows.Thickness]::new(12)
+    $detailsFrame.Child = $detailsViewport
+    $detailsWindow.Content = $detailsFrame
+    $script:detailsPositioning = $false
+    $script:closing = $false
+}
+
+Initialize-DetailsWindow
 
 function Set-ColorStop {
     param($name, $hex)
@@ -435,6 +624,149 @@ function Set-Bar {
     $bar = Find $name
     $clamped = [math]::Max(0, [math]::Min(100, $percent))
     $bar.Width = 118 * ($clamped / 100.0)
+}
+
+function Set-QuotaDisplay {
+    param([string]$Prefix, $Reading, [string]$Accent)
+    $value = Find ($Prefix + 'QuotaVal')
+    $hint = Find ($Prefix + 'QuotaHint')
+    $bar = Find ($Prefix + 'QuotaBar')
+    $value.Text = [string]$Reading.Text
+    $detail = [string]$Reading.Detail
+    if ($null -ne $Reading.UpdatedAt) {
+        $stamp = ([datetime]$Reading.UpdatedAt).ToString('HH:mm:ss')
+        if ($Reading.State -eq 'stale') { $detail = '上次成功 ' + $stamp + ' · ' + $detail }
+        else { $detail = $stamp + ' 更新 · ' + $detail }
+    }
+    $hint.Text = $detail.TrimEnd(' ', '·')
+    $hint.ToolTip = $hint.Text
+    $value.ToolTip = $hint.Text
+    $color = $Accent
+    $percent = 0.0
+    if ($null -ne $Reading.RemainingPercent) {
+        $percent = [math]::Max([double]0, [math]::Min([double]100, [double]$Reading.RemainingPercent))
+        if ($percent -le 10) { $color = '#FB7185' }
+        elseif ($percent -le 25) { $color = '#FBBF24' }
+    }
+    if ($Reading.State -eq 'stale') { $color = '#FBBF24' }
+    elseif ($Reading.State -in @('quota-exhausted', 'window-exhausted')) { $color = '#FB7185' }
+    elseif ($Reading.State -ne 'ok') { $color = '#8EA0B8' }
+    $brush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($color)
+    $bar.Background = $brush
+    $value.Foreground = $brush
+    $bar.Width = [math]::Max(0, $bar.Parent.ActualWidth) * ($percent / 100.0)
+
+    if ($Prefix -eq 'Token') {
+        # The same daily reading feeds both views; never use the wallet balance.
+        $headValue = Find 'TokenQuotaHeadVal'
+        $headBar = Find 'TokenQuotaHeadBar'
+        $headText = [string]$Reading.Text
+        if ($Reading.State -in @('quota-exhausted', 'window-exhausted')) {
+            $headText = '$0.00'
+        } elseif ($Reading.State -in @('ok', 'stale')) {
+            $headText = $headText -replace '^今日剩余\s*', ''
+        }
+        if ($Reading.State -eq 'stale') { $headText = '缓存 ' + $headText }
+        $headValue.Text = $headText
+        $headValue.Foreground = $brush
+        $headBar.Background = $brush
+        $headBar.Width = [math]::Max(0, $headBar.Parent.ActualWidth) * ($percent / 100.0)
+        (Find 'TokenQuotaBadge').ToolTip = 'Token API 今日剩余额度 · ' + $hint.Text + ' · 点击小灵展开其他数据'
+    }
+}
+
+function Set-CursorQuotaDisplay {
+    param($Reading)
+    $bucketNames = @(
+        @{ Key = 'Auto'; Prefix = 'CursorAuto'; Accent = '#67E8F9' },
+        @{ Key = 'Advanced'; Prefix = 'CursorAdvanced'; Accent = '#38BDF8' },
+        @{ Key = 'Grok'; Prefix = 'CursorGrok'; Accent = '#FBBF24' }
+    )
+    foreach ($item in $bucketNames) {
+        $bucket = $null
+        if ($null -ne $Reading -and $null -ne $Reading.Buckets) {
+            if ($Reading.Buckets -is [System.Collections.IDictionary] -and $Reading.Buckets.Contains($item.Key)) {
+                $bucket = $Reading.Buckets[$item.Key]
+            } elseif ($Reading.Buckets.PSObject -and $Reading.Buckets.PSObject.Properties[$item.Key]) {
+                $bucket = $Reading.Buckets.($item.Key)
+            }
+        }
+        if ($null -eq $bucket) {
+            $state = 'unsupported'
+            $text = '暂无分项'
+            $percent = $null
+            if ($null -ne $Reading -and $Reading.State -notin @('ok', 'stale')) {
+                $state = [string]$Reading.State
+                $text = [string]$Reading.Text
+            }
+        } else {
+            $state = [string]$bucket.State
+            $text = [string]$bucket.Text
+            $percent = $bucket.RemainingPercent
+            if ([string]::IsNullOrWhiteSpace($text)) { $text = '暂无分项' }
+        }
+        $value = Find ($item.Prefix + 'QuotaVal')
+        $bar = Find ($item.Prefix + 'QuotaBar')
+        $value.Text = $text
+        $tooltip = [string]$Reading.Detail
+        if ($null -ne $bucket -and $bucket.Detail) { $tooltip = [string]$bucket.Detail + ' · ' + $tooltip }
+        if ($state -eq 'stale') {
+            $value.Text = '缓存 ' + $text
+            if ($null -ne $bucket.UpdatedAt) {
+                $tooltip = '上次成功 ' + ([datetime]$bucket.UpdatedAt).ToString('HH:mm:ss') + ' · ' + $tooltip
+            }
+        }
+        $value.ToolTip = $tooltip
+        $color = $item.Accent
+        $fill = 0.0
+        if ($null -ne $percent) {
+            $fill = [math]::Max([double]0, [math]::Min([double]100, [double]$percent))
+            if ($fill -le 10) { $color = '#FB7185' }
+            elseif ($fill -le 25) { $color = '#FBBF24' }
+        }
+        if ($Reading.State -eq 'stale' -or $state -eq 'stale') { $color = '#FBBF24' }
+        elseif ($state -in @('quota-exhausted', 'window-exhausted')) { $color = '#FB7185' }
+        elseif ($state -notin @('ok', 'stale')) { $color = '#8EA0B8' }
+        $brush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($color)
+        $bar.Background = $brush
+        $value.Foreground = $brush
+        $bar.Width = [math]::Max(0, $bar.Parent.ActualWidth) * ($fill / 100.0)
+        if ($item.Key -eq 'Auto') {
+            # This badge lives with the pet, outside the click-to-open card.
+            # It uses only the Auto bucket, never the combined or other quotas.
+            $headValue = Find 'CursorAutoHeadVal'
+            $headBar = Find 'CursorAutoHeadBar'
+            $headValue.Text = $text
+            $isCached = ($Reading.State -eq 'stale' -or $state -eq 'stale')
+            if ($null -ne $percent -and $state -in @('ok', 'stale', 'quota-exhausted', 'window-exhausted')) {
+                $headValue.Text = $fill.ToString('0.##', [System.Globalization.CultureInfo]::InvariantCulture) + '%'
+            }
+            if ($isCached) { $headValue.Text = '缓存 ' + $headValue.Text }
+            $headValue.Foreground = $brush
+            $headBar.Background = $brush
+            $headBar.Width = [math]::Max(0, $headBar.Parent.ActualWidth) * ($fill / 100.0)
+            $headDetail = 'Cursor Auto 剩余额度'
+            if ($null -ne $bucket -and $bucket.Detail) { $headDetail += ' · ' + [string]$bucket.Detail }
+            $headUpdated = $Reading.UpdatedAt
+            if ($null -ne $bucket -and $null -ne $bucket.UpdatedAt) { $headUpdated = $bucket.UpdatedAt }
+            if ($null -ne $headUpdated) {
+                $headStamp = ([datetime]$headUpdated).ToString('HH:mm:ss')
+                if ($isCached) { $headDetail += ' · 上次成功 ' + $headStamp }
+                else { $headDetail += ' · ' + $headStamp + ' 更新' }
+            }
+            (Find 'CursorAutoBadge').ToolTip = $headDetail + ' · 点击小灵展开其他数据'
+        }
+    }
+
+    $hint = Find 'CursorQuotaHint'
+    $detail = [string]$Reading.Detail
+    if ($null -ne $Reading.UpdatedAt) {
+        $stamp = ([datetime]$Reading.UpdatedAt).ToString('HH:mm:ss')
+        if ($Reading.State -eq 'stale') { $detail = '上次成功 ' + $stamp + ' · ' + $detail }
+        else { $detail = $stamp + ' 更新 · ' + $detail }
+    }
+    $hint.Text = $detail.TrimEnd(' ', '·')
+    $hint.ToolTip = $hint.Text
 }
 
 function Format-Rate {
@@ -499,27 +831,69 @@ function Set-Mood {
     }
 }
 
+function Update-DetailsPosition {
+    if (-not $script:expanded -or $script:detailsPositioning) { return }
+    $script:detailsPositioning = $true
+    try {
+        $petHandle = [System.Windows.Interop.WindowInteropHelper]::new($window).EnsureHandle()
+        $screen = [System.Windows.Forms.Screen]::FromHandle($petHandle)
+        $area = $screen.WorkingArea
+        $detailsHandle = [System.Windows.Interop.WindowInteropHelper]::new($detailsWindow).EnsureHandle()
+        # Move to the target monitor before measuring, so its DPI is applied.
+        if ([System.Windows.Forms.Screen]::FromHandle($detailsHandle).DeviceName -ne $screen.DeviceName) {
+            [void][SpiritNative.Dpi]::SetWindowPos($detailsHandle, [IntPtr]::Zero, ($area.Right - 1), ($area.Top + 1), 0, 0, 0x15)
+        }
+        $dpi = [SpiritNative.Dpi]::GetDpiForWindow($detailsHandle)
+        if ($dpi -lt 96) { $dpi = 96 }
+        $deviceScale = $dpi / 96.0
+        $margin = [int][math]::Ceiling(12 * $deviceScale)
+        $availableWidth = [math]::Max(1.0, ($area.Width - 2 * $margin) / $deviceScale)
+        $availableHeight = [math]::Max(1.0, ($area.Height - 2 * $margin) / $deviceScale)
+        $detailsViewport.MaxWidth = [math]::Max(1.0, $availableWidth - 24)
+        $detailsViewport.MaxHeight = [math]::Max(1.0, $availableHeight - 24)
+        $card.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
+        $panelScale = [math]::Min([double]$script:scale, $detailsViewport.MaxWidth / [math]::Max(1.0, $card.DesiredSize.Width))
+        $detailsScale.ScaleX = $panelScale
+        $detailsScale.ScaleY = $panelScale
+        $detailsFrame.Measure([System.Windows.Size]::new($availableWidth, $availableHeight))
+        $detailsWindow.UpdateLayout()
+        $pixelWidth = [int][math]::Ceiling($detailsFrame.DesiredSize.Width * $deviceScale)
+        $pixelHeight = [int][math]::Ceiling($detailsFrame.DesiredSize.Height * $deviceScale)
+        $left = [math]::Max($area.Left + $margin, $area.Right - $margin - $pixelWidth)
+        $top = $area.Top + $margin
+        # Physical coordinates also handle monitors with a different DPI or origin.
+        [void][SpiritNative.Dpi]::SetWindowPos($detailsHandle, [IntPtr]::Zero, $left, $top, $pixelWidth, $pixelHeight, 0x14)
+    } finally {
+        $script:detailsPositioning = $false
+    }
+}
+
 function Set-Expanded {
     param([bool]$Show)
     $script:expanded = $Show
     if ($Show) {
         $card.Visibility = 'Visible'
         (Find 'MenuPanel').Header = '收起数据'
-        (Find 'FootText').Text = '拖动换位置，滚轮或滑条可缩放'
+        $detailsWindow.Topmost = $window.Topmost
+        if ($null -eq $detailsWindow.Owner) { $detailsWindow.Owner = $window }
+        Update-DetailsPosition
+        if (-not $detailsWindow.IsVisible) { $detailsWindow.Show() }
+        Update-DetailsPosition
     } else {
+        if ($detailsWindow.IsVisible) { $detailsWindow.Hide() }
         $card.Visibility = 'Collapsed'
         (Find 'MenuPanel').Header = '展开数据'
     }
 }
 
-$settings = @{ Left = $null; Top = $null; Topmost = $true; Expanded = $true; Scale = 0.72 }
+$settings = @{ Left = $null; Top = $null; Topmost = $true; Expanded = $false; Scale = 0.72 }
 if (Test-Path $statePath) {
     try {
         $saved = Get-Content -Path $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $settings.Left = $saved.Left
         $settings.Top = $saved.Top
         if ($null -ne $saved.Topmost) { $settings.Topmost = [bool]$saved.Topmost }
-        if ($null -ne $saved.Expanded) { $settings.Expanded = [bool]$saved.Expanded }
+        # Start compact on every launch; the remaining data is click-to-open.
         if ($null -ne $saved.Scale) { $settings.Scale = [double]$saved.Scale }
     } catch {}
 }
@@ -539,6 +913,8 @@ function Set-PetScale {
     $rootScale = Find 'RootScale'
     $rootScale.ScaleX = $Value
     $rootScale.ScaleY = $Value
+    $detailsScale.ScaleX = $Value
+    $detailsScale.ScaleY = $Value
     $pct = [int][math]::Round($Value * 100, 0)
     (Find 'SizeVal').Text = ('{0}%' -f $pct)
     $slider = Find 'SizeSlider'
@@ -547,6 +923,7 @@ function Set-PetScale {
         $slider.Value = $pct
         $script:scaleLock = $false
     }
+    if ($script:expanded) { Update-DetailsPosition }
 }
 
 function Save-State {
@@ -760,22 +1137,35 @@ function Test-Inside {
 }
 
 $script:diskOpen = $false
+function Toggle-DiskDetails {
+    $script:diskOpen = -not $script:diskOpen
+    if ($script:diskOpen) { (Find 'DiskHost').Visibility = 'Visible' }
+    else { (Find 'DiskHost').Visibility = 'Collapsed' }
+    $script:diskStamp = ''
+}
+
 $window.Add_PreviewMouseLeftButtonUp({
     if ($pointer.Down -and -not $pointer.Dragged) {
-        if (Test-Inside $_.OriginalSource 'DiskRow') {
-            $script:diskOpen = -not $script:diskOpen
-            if ($script:diskOpen) { (Find 'DiskHost').Visibility = 'Visible' }
-            else { (Find 'DiskHost').Visibility = 'Collapsed' }
-            $script:diskStamp = ''
-        } else {
-            Set-Expanded (-not $script:expanded)
-            Save-State
-        }
+        Set-Expanded (-not $script:expanded)
+        Save-State
     }
     $pointer.Down = $false
 })
+$detailsWindow.Add_MouseLeftButtonUp({
+    if (Test-Inside $_.OriginalSource 'DiskRow') { Toggle-DiskDetails }
+})
+$detailsWindow.Add_SizeChanged({ Update-DetailsPosition })
+$window.Add_LocationChanged({ Update-DetailsPosition })
+$detailsWindow.Add_Closing({
+    if (-not $script:closing) {
+        $_.Cancel = $true
+        Set-Expanded $false
+        Save-State
+    }
+})
 
-(Find 'CloseBtn').Add_Click({ $window.Close() })
+(Find 'CloseBtn').ToolTip = '收起详情'
+(Find 'CloseBtn').Add_Click({ Set-Expanded $false; Save-State })
 (Find 'MenuExit').Add_Click({ $window.Close() })
 (Find 'MenuPanel').Add_Click({ Set-Expanded (-not $script:expanded); Save-State })
 (Find 'MenuSmaller').Add_Click({ Set-PetScale ($script:scale - 0.08); Save-State })
@@ -785,16 +1175,32 @@ $window.Add_PreviewMouseLeftButtonUp({
     Set-PetScale ((Find 'SizeSlider').Value / 100.0)
     Save-State
 })
-$window.Add_PreviewMouseWheel({
+$scaleWheelHandler = {
+    param($sender, $eventArgs)
+    # A tall details card scrolls normally; the pet wheel still controls size.
+    if ($sender -eq $detailsWindow -and $detailsViewport.ScrollableHeight -gt 0) { return }
     $step = 0.06
-    if ($_.Delta -lt 0) { $step = -0.06 }
+    if ($eventArgs.Delta -lt 0) { $step = -0.06 }
     Set-PetScale ($script:scale + $step)
     Save-State
-    $_.Handled = $true
-})
+    $eventArgs.Handled = $true
+}
+$window.Add_PreviewMouseWheel($scaleWheelHandler)
+$detailsWindow.Add_PreviewMouseWheel($scaleWheelHandler)
 Set-PetScale ([double]$settings.Scale)
+(Find 'MenuQuotaRefresh').Add_Click({ $sync.QuotaRefreshRequested = $true })
+(Find 'MenuQuotaSettings').Add_Click({
+    try {
+        . $quotaSettingsLib
+        $changed = Show-SpiritQuotaSettings -Owner $window -StateDir $stateDir
+        if ($changed) { $sync.QuotaRefreshRequested = $true }
+    } catch {
+        [void][System.Windows.MessageBox]::Show($window, '额度设置无法打开，请检查模块文件后重启。', '小灵 · 额度设置')
+    }
+})
 (Find 'MenuTopmost').Add_Click({
     $window.Topmost = [bool](Find 'MenuTopmost').IsChecked
+    $detailsWindow.Topmost = $window.Topmost
     Save-State
 })
 (Find 'MenuStartup').Add_Click({
@@ -841,6 +1247,8 @@ $timer.Add_Tick({
     }
 
     if (($anim.Tick % 15) -ne 0) { return }
+    Set-CursorQuotaDisplay $sync.CursorQuota
+    Set-QuotaDisplay 'Token' $sync.TokenQuota '#A78BFA'
     if (-not $sync.Ready) { return }
 
     $cpu = [double]$sync.Cpu
@@ -910,6 +1318,7 @@ $timer.Add_Tick({
         }
         (Find 'TempHint').Text = $hint
     }
+
 
     if ($sync.GpuKnown -and $null -ne $sync.Gpu) {
         (Find 'GpuVal').Text = '{0:N0}%' -f [double]$sync.Gpu
@@ -1000,19 +1409,41 @@ $timer.Add_Tick({
         (Find 'BatteryRow').Visibility = 'Collapsed'
     }
 
-    if ($Shot -and -not $script:ShotDone -and $null -ne $temp) {
+    if ($Shot -and -not $script:ShotDone -and $null -ne $temp -and $sync.QuotaReady) {
         $script:ShotDone = $true
-        $window.UpdateLayout()
-        $width = [int][math]::Ceiling($window.ActualWidth)
-        $height = [int][math]::Ceiling($window.ActualHeight)
-        $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap $width, $height, 96, 96, ([System.Windows.Media.PixelFormats]::Pbgra32)
-        $bmp.Render($window)
-        $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
-        $encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
-        $shotPath = Join-Path $root 'preview.png'
-        $stream = [System.IO.File]::Open($shotPath, 'Create')
-        $encoder.Save($stream)
-        $stream.Close()
+        $wasExpanded = $script:expanded
+        $stream = $null
+        try {
+            # Compose both windows in the preview without changing the pet's position.
+            Set-Expanded $true
+            $window.UpdateLayout()
+            Set-CursorQuotaDisplay $sync.CursorQuota
+            Set-QuotaDisplay 'Token' $sync.TokenQuota '#A78BFA'
+            $window.UpdateLayout()
+            $detailsWindow.UpdateLayout()
+            $previewWidth = $window.ActualWidth + $detailsWindow.ActualWidth
+            $previewHeight = [math]::Max($window.ActualHeight, $detailsWindow.ActualHeight)
+            $width = [int][math]::Ceiling($previewWidth * 2)
+            $height = [int][math]::Ceiling($previewHeight * 2)
+            $visual = New-Object System.Windows.Media.DrawingVisual
+            $drawing = $visual.RenderOpen()
+            try {
+                $petRect = [System.Windows.Rect]::new(0, ($previewHeight - $window.ActualHeight) / 2, $window.ActualWidth, $window.ActualHeight)
+                $detailsRect = [System.Windows.Rect]::new($window.ActualWidth, 0, $detailsWindow.ActualWidth, $detailsWindow.ActualHeight)
+                $drawing.DrawRectangle([System.Windows.Media.VisualBrush]::new($window), $null, $petRect)
+                $drawing.DrawRectangle([System.Windows.Media.VisualBrush]::new($detailsWindow), $null, $detailsRect)
+            } finally { $drawing.Close() }
+            $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap $width, $height, 192, 192, ([System.Windows.Media.PixelFormats]::Pbgra32)
+            $bmp.Render($visual)
+            $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+            $encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+            $shotPath = Join-Path $root 'preview.png'
+            $stream = [System.IO.File]::Open($shotPath, 'Create')
+            $encoder.Save($stream)
+        } finally {
+            if ($null -ne $stream) { $stream.Close() }
+            Set-Expanded $wasExpanded
+        }
     }
 })
 $timer.Start()
@@ -1039,8 +1470,10 @@ $window.Add_ContentRendered({
     Save-State
 })
 
+$window.Add_Closing({ $script:closing = $true })
 $window.Add_Closed({
     $timer.Stop()
+    try { $detailsWindow.Close() } catch {}
     Save-State
     $sync.Stop = $true
     try { $notify.Visible = $false; $notify.Dispose() } catch {}
@@ -1048,6 +1481,9 @@ $window.Add_Closed({
     try { $gpuPs.Stop() } catch {}
     try { $fastRs.Close() } catch {}
     try { $gpuRs.Close() } catch {}
+    try { $quotaPs.Stop() } catch {}
+    try { $quotaRs.Close() } catch {}
+    try { $quotaPs.Dispose(); $quotaRs.Dispose() } catch {}
     try { $created.ReleaseMutex() } catch {}
     try { $created.Dispose() } catch {}
     [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()

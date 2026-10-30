@@ -10,6 +10,7 @@
 *.log
 /log.txt
 /window.json
+/quotas.json
 
 # Credentials and local settings
 .env
