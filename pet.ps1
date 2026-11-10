@@ -66,6 +66,9 @@ namespace SpiritNative {
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
     }
 }
 '@
@@ -210,13 +213,13 @@ $xaml = @'
             <MenuItem x:Name="MenuExit" Header="让小灵离开"/>
         </ContextMenu>
     </Window.ContextMenu>
-    <Border Background="Transparent" Padding="10,8,12,10">
+    <Border Background="Transparent" Padding="0">
         <Border.LayoutTransform>
             <ScaleTransform x:Name="RootScale" ScaleX="0.72" ScaleY="0.72"/>
         </Border.LayoutTransform>
     <Grid>
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="164"/>
+            <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <Border x:Name="Card" Grid.Column="1" Visibility="Collapsed" CornerRadius="22" Padding="18,14,14,14" MinWidth="292">
@@ -454,44 +457,20 @@ $xaml = @'
             </StackPanel>
         </Border>
 
-        <Canvas x:Name="Pet" Grid.Column="0" Width="164" Height="276" HorizontalAlignment="Center" VerticalAlignment="Center" Panel.ZIndex="2">
-            <Canvas.RenderTransform>
-                <TranslateTransform x:Name="PetBob" Y="0"/>
-            </Canvas.RenderTransform>
-            <Border x:Name="QuotaHeadBadge" Canvas.Left="0" Canvas.Top="4" Width="164" Height="58" CornerRadius="11"
-                    Background="#F0161C2B" BorderBrush="#4467E8F9" BorderThickness="1" Padding="8,4" Cursor="Hand">
-                <StackPanel>
-                    <StackPanel x:Name="CursorAutoBadge" ToolTip="Cursor Auto 剩余额度；点击小灵展开其他数据">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="66"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="Cursor Auto" FontSize="11" Foreground="#D5DEEA" VerticalAlignment="Center"/>
-                            <TextBlock x:Name="CursorAutoHeadVal" Grid.Column="1" Text="读取中" FontSize="12" FontWeight="SemiBold"
-                                       Foreground="#67E8F9" HorizontalAlignment="Right" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
-                        </Grid>
-                        <Border Height="2" CornerRadius="1" Background="#22FFFFFF" Margin="0,2,0,0">
-                            <Border x:Name="CursorAutoHeadBar" Width="0" Height="2" CornerRadius="1" Background="#67E8F9" HorizontalAlignment="Left"/>
-                        </Border>
-                    </StackPanel>
-                    <StackPanel x:Name="TokenQuotaBadge" Margin="0,4,0,0" ToolTip="Token API 今日剩余额度；点击小灵展开其他数据">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="66"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Text="Token API" FontSize="11" Foreground="#D5DEEA" VerticalAlignment="Center"/>
-                            <TextBlock x:Name="TokenQuotaHeadVal" Grid.Column="1" Text="未连接" FontSize="12" FontWeight="SemiBold"
-                                       Foreground="#A78BFA" HorizontalAlignment="Right" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
-                        </Grid>
-                        <Border Height="2" CornerRadius="1" Background="#22FFFFFF" Margin="0,2,0,0">
-                            <Border x:Name="TokenQuotaHeadBar" Width="0" Height="2" CornerRadius="1" Background="#A78BFA" HorizontalAlignment="Left"/>
-                        </Border>
-                    </StackPanel>
-                </StackPanel>
-            </Border>
-            <Canvas x:Name="PetArt" Canvas.Left="0" Canvas.Top="66" Width="164" Height="210">
+        <Border x:Name="Pet" Grid.Column="0" Height="32" CornerRadius="8" Padding="4,0,10,0" Cursor="Hand"
+                Background="#D6F4F1EE" BorderBrush="#5528303C" BorderThickness="1" Panel.ZIndex="2">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="28"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Viewbox Width="26" Height="26" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <Canvas Width="164" Height="210">
+                        <Canvas.RenderTransform>
+                            <TranslateTransform x:Name="PetBob" Y="0"/>
+                        </Canvas.RenderTransform>
+                        <Canvas x:Name="PetArt" Width="164" Height="210">
             <Ellipse Canvas.Left="36" Canvas.Top="168" Width="96" Height="16" Fill="#33000000"/>
             <Ellipse x:Name="Aura" Canvas.Left="16" Canvas.Top="42" Width="132" Height="132" Opacity="0.55">
                 <Ellipse.Fill>
@@ -549,8 +528,29 @@ $xaml = @'
                 </Ellipse.Fill>
             </Ellipse>
             <TextBlock x:Name="Zzz" Canvas.Left="118" Canvas.Top="36" Text="" Foreground="#E0F2FE" FontSize="16" FontWeight="Bold" Opacity="0"/>
-            </Canvas>
-        </Canvas>
+                        </Canvas>
+                    </Canvas>
+                </Viewbox>
+                <StackPanel x:Name="CursorAutoBadge" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="6,0,0,0"
+                            ToolTip="Cursor Auto 剩余额度；点击小灵展开其他数据">
+                    <TextBlock Text="Cursor Auto" FontSize="12" Foreground="#1C222C" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="CursorAutoHeadVal" Text="读取中" FontSize="12" FontWeight="Bold" Margin="6,0,0,0"
+                               Foreground="#085A78" VerticalAlignment="Center"/>
+                    <Border Width="0" Height="0" Visibility="Collapsed">
+                        <Border x:Name="CursorAutoHeadBar" Width="0" Height="2"/>
+                    </Border>
+                </StackPanel>
+                <StackPanel x:Name="TokenQuotaBadge" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="14,0,0,0"
+                            ToolTip="Token API 今日剩余额度；点击小灵展开其他数据">
+                    <TextBlock Text="Token API" FontSize="12" Foreground="#1C222C" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="TokenQuotaHeadVal" Text="未连接" FontSize="12" FontWeight="Bold" Margin="6,0,0,0"
+                               Foreground="#5B21B6" VerticalAlignment="Center"/>
+                    <Border Width="0" Height="0" Visibility="Collapsed">
+                        <Border x:Name="TokenQuotaHeadBar" Width="0" Height="2"/>
+                    </Border>
+                </StackPanel>
+            </Grid>
+        </Border>
     </Grid>
     </Border>
 </Window>
@@ -670,9 +670,36 @@ function Set-QuotaDisplay {
         $headValue.Text = $headText
         $headValue.Foreground = $brush
         $headBar.Background = $brush
+        $dollarRatio = Get-TokenDollarRatio $headText
+        if ($null -ne $dollarRatio) { $percent = $dollarRatio * 100.0 }
         $headBar.Width = [math]::Max(0, $headBar.Parent.ActualWidth) * ($percent / 100.0)
         (Find 'TokenQuotaBadge').ToolTip = 'Token API 今日剩余额度 · ' + $hint.Text + ' · 点击小灵展开其他数据'
+        Publish-TokenDockBar $headText $dollarRatio
     }
+}
+
+function Get-TokenDollarRatio {
+    param([string]$Text)
+    if ($Text -notmatch '(\d+(?:\.\d+)?)') { return $null }
+    $amount = [double]$Matches[1]
+    $ratio = $amount / 400.0
+    if ($ratio -lt 0) { $ratio = 0 }
+    if ($ratio -gt 1) { $ratio = 1 }
+    return $ratio
+}
+
+function Publish-TokenDockBar {
+    param([string]$Text, $Ratio)
+    if ($null -eq $Ratio) { return }
+    if ($Text -notmatch '(\d+(?:\.\d+)?)') { return }
+    $amount = [double]$Matches[1]
+    $color = '34,150,84'
+    if ($Ratio -le 0.15) { $color = '214,64,74' }
+    elseif ($Ratio -le 0.40) { $color = '214,148,36' }
+    elseif ($Ratio -le 0.70) { $color = '196,176,42' }
+    $path = 'D:\Tree_tasks\Rainmeter\Skins\TreeDock\@Resources\token-quota.txt'
+    $body = ('{0:0.000}' -f $Ratio) + "`r`n" + $color + "`r`n" + ('{0:0.00}' -f $amount) + "`r`n"
+    [System.IO.File]::WriteAllText($path, $body, (New-Object System.Text.UTF8Encoding $false))
 }
 
 function Set-CursorQuotaDisplay {
@@ -938,16 +965,28 @@ function Save-State {
 }
 
 function Move-ToCorner {
+    if ($pointer.Down) { return }
     $helper = New-Object System.Windows.Interop.WindowInteropHelper $window
     $hwnd = $helper.EnsureHandle()
     $screen = [System.Windows.Forms.Screen]::FromHandle($hwnd)
-    $area = $screen.WorkingArea
+    $bounds = $screen.Bounds
+    $rect = New-Object SpiritNative.Dpi+RECT
+    if (-not [SpiritNative.Dpi]::GetWindowRect($hwnd, [ref]$rect)) { return }
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    if ($width -lt 20 -or $height -lt 20) { return }
     $dpi = [SpiritNative.Dpi]::GetDpiForWindow($hwnd)
     if ($dpi -lt 96) { $dpi = 96 }
-    $scale = $dpi / 96.0
-    $window.UpdateLayout()
-    $window.Left = ($area.Right / $scale) - $window.ActualWidth - 28
-    $window.Top = ($area.Bottom / $scale) - $window.ActualHeight - 24
+    $barHeight = [int](32 * $dpi / 96.0)
+    $gapWidth = [int](340 * $dpi / 96.0)
+    $x = $bounds.Right - $width - 8
+    $gapLeft = $bounds.Right - $gapWidth
+    if ($x -lt $gapLeft) { $x = $gapLeft }
+    $y = $bounds.Top + [int](($barHeight - $height) / 2)
+    if ($y -lt $bounds.Top) { $y = $bounds.Top }
+    if ([math]::Abs($rect.Left - $x) -le 2 -and [math]::Abs($rect.Top - $y) -le 2) { return }
+    [void][SpiritNative.Dpi]::SetWindowPos($hwnd, [IntPtr](-1), $x, $y, 0, 0, 0x0011)
+    $window.Topmost = $true
 }
 
 function Test-OnScreen {
@@ -1187,7 +1226,7 @@ $scaleWheelHandler = {
 }
 $window.Add_PreviewMouseWheel($scaleWheelHandler)
 $detailsWindow.Add_PreviewMouseWheel($scaleWheelHandler)
-Set-PetScale ([double]$settings.Scale)
+Set-PetScale 1
 (Find 'MenuQuotaRefresh').Add_Click({ $sync.QuotaRefreshRequested = $true })
 (Find 'MenuQuotaSettings').Add_Click({
     try {
@@ -1224,6 +1263,7 @@ $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(33)
 $timer.Add_Tick({
     $anim.Tick++
+    if (($anim.Tick % 20) -eq 0) { Move-ToCorner }
     $petBob.Y = [math]::Sin($anim.Tick / 14.0) * 4
     $tailRotate.Angle = 16 + ([math]::Sin($anim.Tick / 9.0) * 14)
     $crystal.Opacity = 0.75 + ([math]::Sin($anim.Tick / 8.0) * 0.25)
@@ -1460,13 +1500,7 @@ $notify.Add_DoubleClick({
 })
 
 $window.Add_ContentRendered({
-    if ($null -ne $settings.Left -and $null -ne $settings.Top) {
-        $window.Left = [double]$settings.Left
-        $window.Top = [double]$settings.Top
-        if (-not (Test-OnScreen)) { Move-ToCorner }
-    } else {
-        Move-ToCorner
-    }
+    Move-ToCorner
     Save-State
 })
 
